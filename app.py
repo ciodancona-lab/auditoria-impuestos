@@ -50,7 +50,6 @@ SOCIEDADES_DEFAULT = [
     "SIBI SA",
     "La Forza Gastronómica SAS",
     "La Stazione Gastronómica SAS",
-    "DANCONA ALIMENTOS",
 ]
 
 # =============================================================================
