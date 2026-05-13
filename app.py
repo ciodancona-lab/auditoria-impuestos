@@ -2,7 +2,7 @@
 """
 Auditor IVA - AFIP/ARCA vs Libro IVA Sistema
 Grupo Dancona / Auditorías
-Versión v2.0
+Versión v3.0
 
 Dos auditorías separadas:
 1) Auditoría de Comprobantes: existencia documental por CUIT + Tipo + PV + Número.
@@ -39,7 +39,7 @@ except Exception:
     REPORTLAB_OK = False
 
 APP_TITLE = "Auditor IVA"
-APP_VERSION = "v2.0"
+APP_VERSION = "v3.0"
 HIST_FILE = Path("historial_auditor_iva.json")
 EXPORTS_DIR = Path("exports")
 EXPORTS_DIR.mkdir(exist_ok=True)
@@ -753,6 +753,14 @@ def export_excel(result: Dict[str, Any], metadata: Dict[str, Any]) -> bytes:
         "Libro Normalizado": result.get("libro_norm", pd.DataFrame()),
     }
     if result["tipo_auditoria"] == "Auditoría IVA del Mes":
+        control_mes = pd.DataFrame([
+            ["Universo fiscal", "Libro IVA cargado para el período", "No se excluyen comprobantes por fecha visible; se informan como alerta."],
+            ["IVA computado por Libro", metrics.get("iva_computado_libro_mes", 0), "Total del Libro IVA normalizado."],
+            ["IVA Libro no encontrado en AFIP", metrics.get("iva_libro_no_encontrado_afip", 0), "Riesgo de crédito fiscal computado sin respaldo encontrado."],
+            ["IVA AFIP del mes no registrado", metrics.get("iva_afip_mes_no_registrado", 0), "Potencial comprobante omitido en el Libro del período."],
+            ["IVA con fecha fuera del período", metrics.get("iva_fuera_periodo_libro", 0), "Comprobantes registrados en el Libro del período pero con fecha de comprobante anterior/posterior."],
+        ], columns=["Control", "Valor", "Interpretación contable"])
+        sheets["Control IVA del Mes"] = control_mes
         sheets["AFIP Mes no Registrado"] = result.get("afip_mes_no_registrado", pd.DataFrame())
         sheets["Libro Fuera Periodo"] = result.get("libro_fuera_periodo", pd.DataFrame())
 
@@ -787,6 +795,8 @@ def export_pdf(result: Dict[str, Any], metadata: Dict[str, Any]) -> Optional[byt
         ["IVA Libro IVA", fmt_money(metrics.get("iva_libro", 0))],
         ["Diferencia neta", fmt_money(metrics.get("diferencia_neta", 0))],
         ["Diferencia bruta", fmt_money(metrics.get("diferencia_bruta", 0))],
+        ["Diferencias positivas", fmt_money(metrics.get("diferencias_positivas", 0))],
+        ["Diferencias negativas", fmt_money(metrics.get("diferencias_negativas", 0))],
         ["OK", metrics.get("ok", 0)],
         ["Sólo AFIP", metrics.get("solo_afip", 0)],
         ["Sólo Libro", metrics.get("solo_libro", 0)],
@@ -913,6 +923,10 @@ def render_metrics(result: Dict[str, Any]):
     c7.metric("Sólo Libro", m.get("solo_libro", 0))
     c8.metric("IVA distinto", m.get("iva_distinto", 0))
 
+    c12, c13 = st.columns(2)
+    c12.metric("Diferencias positivas", fmt_money(m.get("diferencias_positivas", 0)))
+    c13.metric("Diferencias negativas", fmt_money(m.get("diferencias_negativas", 0)))
+
     if result["tipo_auditoria"] == "Auditoría IVA del Mes":
         st.info(
             "En esta auditoría el universo fiscal es el Libro IVA cargado para el período. "
@@ -976,15 +990,27 @@ def main():
         st.dataframe(libro_norm.head(50), use_container_width=True)
 
     st.subheader("Paso 2 · Elegir auditoría")
-    b1, b2 = st.columns(2)
-    run_comp = b1.button("1 · Auditoría de Comprobantes", type="primary", use_container_width=True)
-    run_mes = b2.button("2 · Auditoría IVA del Mes", type="secondary", use_container_width=True)
+    tipo_seleccionado = st.radio(
+        "Seleccioná el informe que querés generar",
+        ["Auditoría de Comprobantes", "Auditoría IVA del Mes"],
+        horizontal=True,
+        help=(
+            "Comprobantes = existencia documental por CUIT+Tipo+PV+Número. "
+            "IVA del Mes = validación fiscal del Libro IVA del período contra AFIP/ARCA."
+        ),
+    )
 
-    if not (run_comp or run_mes):
-        st.info("Elegí una auditoría. La de comprobantes revisa existencia documental; la de IVA del mes valida el IVA computado en el período del Libro IVA.")
+    st.caption(
+        "La opción seleccionada queda marcada arriba. El botón rojo de Streamlit ya no se usa como indicador, "
+        "para evitar confundir la auditoría activa."
+    )
+
+    ejecutar = st.button(f"Ejecutar: {tipo_seleccionado}", type="primary", use_container_width=True)
+    if not ejecutar:
+        st.info("Elegí una auditoría y presioná Ejecutar. La de comprobantes revisa existencia documental; la de IVA del mes valida el IVA computado en el período del Libro IVA.")
         return
 
-    if run_comp:
+    if tipo_seleccionado == "Auditoría de Comprobantes":
         result = run_auditoria_comprobantes(afip_norm, libro_norm, tolerancia)
     else:
         result = run_auditoria_iva_mes(afip_norm, libro_norm, int(year), int(month), tolerancia)
