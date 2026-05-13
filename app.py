@@ -2,7 +2,7 @@
 """
 Auditor IVA - AFIP/ARCA vs Libro IVA Sistema
 Grupo Dancona / Auditorías
-Versión v3.0
+Versión v4.0
 
 Dos auditorías separadas:
 1) Auditoría de Comprobantes: existencia documental por CUIT + Tipo + PV + Número.
@@ -39,7 +39,7 @@ except Exception:
     REPORTLAB_OK = False
 
 APP_TITLE = "Auditor IVA"
-APP_VERSION = "v3.0"
+APP_VERSION = "v4.0"
 HIST_FILE = Path("historial_auditor_iva.json")
 EXPORTS_DIR = Path("exports")
 EXPORTS_DIR.mkdir(exist_ok=True)
@@ -587,12 +587,20 @@ def run_auditoria_comprobantes(afip: pd.DataFrame, libro: pd.DataFrame, toleranc
         "diferencia_bruta": float(total_abs),
         "cantidad_afip": int(len(afip)),
         "cantidad_libro": int(len(libro)),
+        "claves_afip": int(len(afip_agg)),
+        "claves_libro": int(len(libro_agg)),
+        "claves_cruzadas": int(len(detalle)),
         "ok": int((detalle["Estado"] == "OK").sum()),
         "solo_afip": int((detalle["Estado"] == "SOLO_AFIP").sum()),
         "solo_libro": int((detalle["Estado"] == "SOLO_LIBRO").sum()),
         "iva_distinto": int((detalle["Estado"] == "IVA_DISTINTO").sum()),
+        "observados": int((detalle["Estado"] != "OK").sum()),
         "duplicados_afip": int(len(dup_afip)),
         "duplicados_libro": int(len(dup_libro)),
+        "iva_solo_afip": float(detalle.loc[detalle["Estado"] == "SOLO_AFIP", "IVA_AFIP"].sum()),
+        "iva_solo_libro": float(detalle.loc[detalle["Estado"] == "SOLO_LIBRO", "IVA_Libro"].sum()),
+        "iva_diferencia_mismo_comprobante": float(detalle.loc[detalle["Estado"] == "IVA_DISTINTO", "Diferencia"].sum()),
+        "iva_diferencia_mismo_comprobante_abs": float(detalle.loc[detalle["Estado"] == "IVA_DISTINTO", "Diferencia"].abs().sum()),
     }
     return {
         "tipo_auditoria": "Auditoría de Comprobantes",
@@ -719,28 +727,42 @@ def export_excel(result: Dict[str, Any], metadata: Dict[str, Any]) -> bytes:
     ws["A7"] = f"Generado: {metadata.get('timestamp','')}"
 
     metrics = result["metrics"]
-    rows = [
-        ("IVA AFIP / ARCA firmado", metrics.get("iva_afip", 0)),
-        ("IVA Libro IVA firmado", metrics.get("iva_libro", 0)),
-        ("Diferencia neta Libro - AFIP", metrics.get("diferencia_neta", 0)),
-        ("Diferencias positivas", metrics.get("diferencias_positivas", 0)),
-        ("Diferencias negativas", metrics.get("diferencias_negativas", 0)),
-        ("Diferencia bruta absoluta", metrics.get("diferencia_bruta", 0)),
-        ("Comprobantes OK", metrics.get("ok", 0)),
-        ("Sólo AFIP / ARCA", metrics.get("solo_afip", 0)),
-        ("Sólo Libro IVA", metrics.get("solo_libro", 0)),
-        ("IVA distinto", metrics.get("iva_distinto", 0)),
-        ("Duplicados AFIP", metrics.get("duplicados_afip", 0)),
-        ("Duplicados Libro", metrics.get("duplicados_libro", 0)),
-    ]
-    if result["tipo_auditoria"] == "Auditoría IVA del Mes":
-        rows.extend([
+    if result["tipo_auditoria"] == "Auditoría de Comprobantes":
+        rows = [
+            ("Auditoría ejecutada", "Control documental por comprobante"),
+            ("Claves únicas AFIP / ARCA", metrics.get("claves_afip", 0)),
+            ("Claves únicas Libro IVA", metrics.get("claves_libro", 0)),
+            ("Comprobantes OK", metrics.get("ok", 0)),
+            ("Comprobantes observados", metrics.get("observados", 0)),
+            ("Sólo AFIP / ARCA", metrics.get("solo_afip", 0)),
+            ("Sólo Libro IVA", metrics.get("solo_libro", 0)),
+            ("Mismo comprobante con IVA distinto", metrics.get("iva_distinto", 0)),
+            ("Duplicados AFIP", metrics.get("duplicados_afip", 0)),
+            ("Duplicados Libro", metrics.get("duplicados_libro", 0)),
+            ("IVA en AFIP no cargado en Libro", metrics.get("iva_solo_afip", 0)),
+            ("IVA en Libro sin respaldo AFIP", metrics.get("iva_solo_libro", 0)),
+            ("Diferencia IVA en comprobantes encontrados", metrics.get("iva_diferencia_mismo_comprobante", 0)),
+            ("Diferencia bruta documental", metrics.get("diferencia_bruta", 0)),
+        ]
+    else:
+        rows = [
+            ("Auditoría ejecutada", "Validación fiscal del IVA computado en el mes"),
             ("IVA computado Libro del mes", metrics.get("iva_computado_libro_mes", 0)),
+            ("IVA AFIP respaldado para comprobantes del Libro", metrics.get("iva_afip_encontrado_para_libro", 0)),
             ("IVA Libro no encontrado en AFIP", metrics.get("iva_libro_no_encontrado_afip", 0)),
             ("IVA AFIP del mes no registrado", metrics.get("iva_afip_mes_no_registrado", 0)),
             ("IVA Libro con fecha comprobante fuera del período", metrics.get("iva_fuera_periodo_libro", 0)),
             ("Cantidad Libro fuera del período", metrics.get("comprobantes_fuera_periodo_libro", 0)),
-        ])
+            ("Diferencia neta Libro - AFIP", metrics.get("diferencia_neta", 0)),
+            ("Diferencias positivas", metrics.get("diferencias_positivas", 0)),
+            ("Diferencias negativas", metrics.get("diferencias_negativas", 0)),
+            ("Diferencia bruta no compensada", metrics.get("diferencia_bruta", 0)),
+            ("Comprobantes OK", metrics.get("ok", 0)),
+            ("Sólo AFIP / ARCA", metrics.get("solo_afip", 0)),
+            ("Sólo Libro IVA", metrics.get("solo_libro", 0)),
+            ("IVA distinto", metrics.get("iva_distinto", 0)),
+            ("Duplicados Libro", metrics.get("duplicados_libro", 0)),
+        ]
     summary_df = pd.DataFrame(rows, columns=["Indicador", "Valor"])
     write_df(ws, summary_df, start_row=10)
 
@@ -789,26 +811,36 @@ def export_pdf(result: Dict[str, Any], metadata: Dict[str, Any]) -> Optional[byt
     story.append(Spacer(1, 0.3*cm))
 
     metrics = result["metrics"]
-    data = [
-        ["Indicador", "Valor"],
-        ["IVA AFIP / ARCA", fmt_money(metrics.get("iva_afip", 0))],
-        ["IVA Libro IVA", fmt_money(metrics.get("iva_libro", 0))],
-        ["Diferencia neta", fmt_money(metrics.get("diferencia_neta", 0))],
-        ["Diferencia bruta", fmt_money(metrics.get("diferencia_bruta", 0))],
-        ["Diferencias positivas", fmt_money(metrics.get("diferencias_positivas", 0))],
-        ["Diferencias negativas", fmt_money(metrics.get("diferencias_negativas", 0))],
-        ["OK", metrics.get("ok", 0)],
-        ["Sólo AFIP", metrics.get("solo_afip", 0)],
-        ["Sólo Libro", metrics.get("solo_libro", 0)],
-        ["IVA distinto", metrics.get("iva_distinto", 0)],
-        ["Duplicados Libro", metrics.get("duplicados_libro", 0)],
-    ]
-    if result["tipo_auditoria"] == "Auditoría IVA del Mes":
-        data.extend([
+    if result["tipo_auditoria"] == "Auditoría de Comprobantes":
+        data = [
+            ["Indicador", "Valor"],
+            ["Claves únicas AFIP", metrics.get("claves_afip", 0)],
+            ["Claves únicas Libro", metrics.get("claves_libro", 0)],
+            ["OK", metrics.get("ok", 0)],
+            ["Observados", metrics.get("observados", 0)],
+            ["Sólo AFIP", metrics.get("solo_afip", 0)],
+            ["Sólo Libro", metrics.get("solo_libro", 0)],
+            ["IVA distinto", metrics.get("iva_distinto", 0)],
+            ["Duplicados Libro", metrics.get("duplicados_libro", 0)],
+            ["IVA AFIP no cargado", fmt_money(metrics.get("iva_solo_afip", 0))],
+            ["IVA Libro sin AFIP", fmt_money(metrics.get("iva_solo_libro", 0))],
+            ["Diferencia bruta documental", fmt_money(metrics.get("diferencia_bruta", 0))],
+        ]
+    else:
+        data = [
+            ["Indicador", "Valor"],
+            ["IVA computado Libro del mes", fmt_money(metrics.get("iva_computado_libro_mes", 0))],
+            ["IVA AFIP respaldado", fmt_money(metrics.get("iva_afip_encontrado_para_libro", 0))],
             ["IVA Libro no encontrado AFIP", fmt_money(metrics.get("iva_libro_no_encontrado_afip", 0))],
             ["IVA AFIP del mes no registrado", fmt_money(metrics.get("iva_afip_mes_no_registrado", 0))],
-            ["IVA fuera del período por fecha comprobante", fmt_money(metrics.get("iva_fuera_periodo_libro", 0))],
-        ])
+            ["IVA fuera del período", fmt_money(metrics.get("iva_fuera_periodo_libro", 0))],
+            ["Diferencia neta", fmt_money(metrics.get("diferencia_neta", 0))],
+            ["Diferencia bruta no compensada", fmt_money(metrics.get("diferencia_bruta", 0))],
+            ["OK", metrics.get("ok", 0)],
+            ["Sólo AFIP", metrics.get("solo_afip", 0)],
+            ["Sólo Libro", metrics.get("solo_libro", 0)],
+            ["IVA distinto", metrics.get("iva_distinto", 0)],
+        ]
     tbl = Table(data, colWidths=[10*cm, 7*cm])
     tbl.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1F4E78")),
@@ -912,31 +944,53 @@ def render_history():
 
 def render_metrics(result: Dict[str, Any]):
     m = result["metrics"]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("IVA AFIP / ARCA", fmt_money(m.get("iva_afip", 0)))
-    c2.metric("IVA Libro IVA", fmt_money(m.get("iva_libro", 0)))
-    c3.metric("Diferencia neta", fmt_money(m.get("diferencia_neta", 0)))
-    c4.metric("Diferencia bruta", fmt_money(m.get("diferencia_bruta", 0)))
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("OK", m.get("ok", 0))
-    c6.metric("Sólo AFIP", m.get("solo_afip", 0))
-    c7.metric("Sólo Libro", m.get("solo_libro", 0))
-    c8.metric("IVA distinto", m.get("iva_distinto", 0))
 
-    c12, c13 = st.columns(2)
-    c12.metric("Diferencias positivas", fmt_money(m.get("diferencias_positivas", 0)))
-    c13.metric("Diferencias negativas", fmt_money(m.get("diferencias_negativas", 0)))
-
-    if result["tipo_auditoria"] == "Auditoría IVA del Mes":
+    if result["tipo_auditoria"] == "Auditoría de Comprobantes":
         st.info(
-            "En esta auditoría el universo fiscal es el Libro IVA cargado para el período. "
-            "La fecha visible de cada línea se usa para alertar comprobantes de fecha anterior/posterior, no para excluirlos automáticamente."
+            "Control documental: esta vista responde si cada comprobante existe o no existe en ambos lados. "
+            "No valida el IVA mensual por fecha de registración; eso corresponde a la Auditoría IVA del Mes."
         )
-        c9, c10, c11 = st.columns(3)
-        c9.metric("IVA Libro no encontrado en AFIP", fmt_money(m.get("iva_libro_no_encontrado_afip", 0)))
-        c10.metric("IVA AFIP del mes no registrado", fmt_money(m.get("iva_afip_mes_no_registrado", 0)))
-        c11.metric("IVA con fecha fuera de período", fmt_money(m.get("iva_fuera_periodo_libro", 0)))
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Claves únicas AFIP", m.get("claves_afip", 0))
+        c2.metric("Claves únicas Libro", m.get("claves_libro", 0))
+        c3.metric("Comprobantes OK", m.get("ok", 0))
+        c4.metric("Comprobantes observados", m.get("observados", 0))
 
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Sólo AFIP / ARCA", m.get("solo_afip", 0))
+        c6.metric("Sólo Libro IVA", m.get("solo_libro", 0))
+        c7.metric("Mismo comprobante, IVA distinto", m.get("iva_distinto", 0))
+        c8.metric("Duplicados Libro", m.get("duplicados_libro", 0))
+
+        c9, c10, c11, c12 = st.columns(4)
+        c9.metric("IVA en AFIP no cargado", fmt_money(m.get("iva_solo_afip", 0)))
+        c10.metric("IVA en Libro sin AFIP", fmt_money(m.get("iva_solo_libro", 0)))
+        c11.metric("Dif. IVA en comprobantes encontrados", fmt_money(m.get("iva_diferencia_mismo_comprobante", 0)))
+        c12.metric("Diferencia bruta documental", fmt_money(m.get("diferencia_bruta", 0)))
+        return
+
+    # Auditoría IVA del Mes
+    st.info(
+        "Control fiscal del período: esta vista parte del Libro IVA cargado como universo del mes y usa AFIP/ARCA como respaldo documental. "
+        "La fecha visible del comprobante se usa para alertar facturas de meses anteriores/posteriores, no para excluirlas automáticamente."
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("IVA computado Libro del mes", fmt_money(m.get("iva_computado_libro_mes", m.get("iva_libro", 0))))
+    c2.metric("IVA AFIP respaldado", fmt_money(m.get("iva_afip_encontrado_para_libro", 0)))
+    c3.metric("Diferencia neta", fmt_money(m.get("diferencia_neta", 0)))
+    c4.metric("Diferencia bruta no compensada", fmt_money(m.get("diferencia_bruta", 0)))
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("IVA Libro no encontrado en AFIP", fmt_money(m.get("iva_libro_no_encontrado_afip", 0)))
+    c6.metric("IVA AFIP del mes no registrado", fmt_money(m.get("iva_afip_mes_no_registrado", 0)))
+    c7.metric("IVA con fecha fuera período", fmt_money(m.get("iva_fuera_periodo_libro", 0)))
+    c8.metric("Comprobantes fuera período", m.get("comprobantes_fuera_periodo_libro", 0))
+
+    c9, c10, c11, c12 = st.columns(4)
+    c9.metric("OK", m.get("ok", 0))
+    c10.metric("Sólo AFIP", m.get("solo_afip", 0))
+    c11.metric("Sólo Libro", m.get("solo_libro", 0))
+    c12.metric("IVA distinto", m.get("iva_distinto", 0))
 
 def main():
     if not login_required():
@@ -1018,21 +1072,39 @@ def main():
     st.subheader(f"Resultado · {result['tipo_auditoria']}")
     render_metrics(result)
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Resumen por estado", "Diferencias por proveedor", "Detalle", "Duplicados / alertas"])
-    with tab1:
-        st.dataframe(result["resumen_estado"], use_container_width=True)
-    with tab2:
-        st.dataframe(result["resumen_proveedor"], use_container_width=True)
-    with tab3:
-        st.dataframe(result["detalle"], use_container_width=True)
-    with tab4:
-        st.write("Duplicados")
-        st.dataframe(result["duplicados"], use_container_width=True)
-        if result["tipo_auditoria"] == "Auditoría IVA del Mes":
+    if result["tipo_auditoria"] == "Auditoría IVA del Mes":
+        tab0, tab1, tab2, tab3, tab4 = st.tabs(["Control IVA del Mes", "Resumen por estado", "Diferencias por proveedor", "Detalle comprobantes", "Alertas del período"])
+        with tab0:
+            control_mes = pd.DataFrame([
+                ["IVA computado Libro del mes", fmt_money(result["metrics"].get("iva_computado_libro_mes", 0)), "Total del Libro IVA cargado como período fiscal."],
+                ["IVA Libro no encontrado en AFIP", fmt_money(result["metrics"].get("iva_libro_no_encontrado_afip", 0)), "Riesgo: crédito fiscal computado sin comprobante encontrado en AFIP/ARCA."],
+                ["IVA AFIP del mes no registrado", fmt_money(result["metrics"].get("iva_afip_mes_no_registrado", 0)), "Potencial crédito fiscal omitido en el Libro del mes."],
+                ["IVA con fecha fuera del período", fmt_money(result["metrics"].get("iva_fuera_periodo_libro", 0)), "Comprobantes tomados en el período con fecha visible anterior/posterior."],
+            ], columns=["Control", "Valor", "Interpretación contable"])
+            st.dataframe(control_mes, use_container_width=True)
+        with tab1:
+            st.dataframe(result["resumen_estado"], use_container_width=True)
+        with tab2:
+            st.dataframe(result["resumen_proveedor"], use_container_width=True)
+        with tab3:
+            st.dataframe(result["detalle"], use_container_width=True)
+        with tab4:
             st.write("AFIP del mes no registrado en Libro")
             st.dataframe(result.get("afip_mes_no_registrado", pd.DataFrame()), use_container_width=True)
             st.write("Libro con fecha de comprobante fuera del período fiscal seleccionado")
             st.dataframe(result.get("libro_fuera_periodo", pd.DataFrame()), use_container_width=True)
+            st.write("Duplicados")
+            st.dataframe(result["duplicados"], use_container_width=True)
+    else:
+        tab1, tab2, tab3, tab4 = st.tabs(["Resumen documental", "Diferencias por proveedor", "Detalle comprobantes", "Duplicados"])
+        with tab1:
+            st.dataframe(result["resumen_estado"], use_container_width=True)
+        with tab2:
+            st.dataframe(result["resumen_proveedor"], use_container_width=True)
+        with tab3:
+            st.dataframe(result["detalle"], use_container_width=True)
+        with tab4:
+            st.dataframe(result["duplicados"], use_container_width=True)
 
     metadata = {
         "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
