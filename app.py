@@ -45,7 +45,7 @@ EXPORTS_DIR = Path("exports")
 EXPORTS_DIR.mkdir(exist_ok=True)
 TOLERANCIA_DEFAULT = 0.01
 
-AUTH_USERS_DEFAULT = {"dancona2016@gmail.com": "Dancona2026*"}
+AUTH_USERS_DEFAULT = {}
 SOCIEDADES_DEFAULT = [
     "SIBI SA",
     "La Forza Gastronómica SAS",
