@@ -13,6 +13,7 @@ Incluye historial completo con descarga posterior de Excel/PDF.
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 import unicodedata
@@ -39,19 +40,19 @@ except Exception:
     REPORTLAB_OK = False
 
 APP_TITLE = "Auditor IVA"
-APP_VERSION = "v5.1"
+APP_VERSION = "v5.2"
 HIST_FILE = Path("historial_auditor_iva.json")
 EXPORTS_DIR = Path("exports")
 EXPORTS_DIR.mkdir(exist_ok=True)
 TOLERANCIA_DEFAULT = 0.01
 
 AUTH_USERS_DEFAULT: Dict[str, str] = {}
-SOCIEDADES_DEFAULT = [
-    "SIBI SA",
-    "La Forza Gastronómica SAS",
-    "La Stazione Gastronómica SAS",
-    "DANCONA ALIMENTOS",
-]
+SOCIEDADES_CONFIG = {
+    "La Forza Gastronómica SAS": "",
+    "La Stazione Gastronómica SAS": "",
+    "SIBI SA": "30-71142417-9",
+}
+SOCIEDADES_DEFAULT = list(SOCIEDADES_CONFIG.keys())
 
 # =============================================================================
 # Login
@@ -72,18 +73,25 @@ def _get_auth_users() -> Dict[str, str]:
 
 def login_required() -> bool:
     if st.session_state.get("auth_ok"):
+        with st.sidebar:
+            st.success(f"Sesión iniciada:\n{st.session_state.get('auth_user', '')}")
+            if st.button("Cerrar sesión"):
+                st.session_state.pop("auth_ok", None)
+                st.session_state.pop("auth_user", None)
+                st.rerun()
         return True
 
-    st.set_page_config(page_title=APP_TITLE, page_icon="🧾", layout="wide")
     st.title(f"{APP_TITLE} · {APP_VERSION}")
     st.caption("Ingreso obligatorio")
-    user = st.text_input("Usuario")
-    pwd = st.text_input("Contraseña", type="password")
+    with st.form("login_form", clear_on_submit=False):
+        user = st.text_input("Usuario")
+        pwd = st.text_input("Contraseña", type="password")
+        submit = st.form_submit_button("Ingresar", type="primary")
     users = _get_auth_users()
     if not users:
         st.error("No hay usuarios configurados. Definí APP_USER y APP_PASSWORD en secrets antes de usar la app.")
         return False
-    if st.button("Ingresar", type="primary"):
+    if submit:
         if users.get(user) == pwd:
             st.session_state["auth_ok"] = True
             st.session_state["auth_user"] = user
@@ -1099,25 +1107,64 @@ def export_pdf(result: Dict[str, Any], metadata: Dict[str, Any]) -> Optional[byt
 def load_history() -> List[Dict[str, Any]]:
     if HIST_FILE.exists():
         try:
-            return json.loads(HIST_FILE.read_text(encoding="utf-8"))
+            data = json.loads(HIST_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
         except Exception:
             return []
     return []
 
 
 def save_history(items: List[Dict[str, Any]]):
-    HIST_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    HIST_FILE.write_text(json.dumps(items[:300], ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _bytes_to_b64(value: Optional[bytes]) -> str:
+    if not value:
+        return ""
+    try:
+        return base64.b64encode(value).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _b64_to_bytes(value: Any) -> Optional[bytes]:
+    if not value:
+        return None
+    try:
+        return base64.b64decode(str(value).encode("utf-8"))
+    except Exception:
+        return None
+
+
+def _read_file_if_exists(path_value: Any) -> Optional[bytes]:
+    if not path_value:
+        return None
+    try:
+        p = Path(str(path_value))
+        if p.exists() and p.is_file():
+            return p.read_bytes()
+    except Exception:
+        return None
+    return None
 
 
 def save_run_to_history(result: Dict[str, Any], metadata: Dict[str, Any], excel_bytes: bytes, pdf_bytes: Optional[bytes]) -> Dict[str, Any]:
+    """Guarda la corrida completa.
+
+    Además de guardar path local, embebe los bytes del Excel/PDF en base64. Esto evita
+    que el historial quede con "archivo no disponible" cuando Streamlit Cloud reinicia
+    y pierde archivos temporales de /exports.
+    """
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_tipo = "comprobantes" if "Comprobantes" in result["tipo_auditoria"] else "iva_mes"
-    excel_path = EXPORTS_DIR / f"auditoria_iva_{safe_tipo}_{stamp}.xlsx"
-    pdf_path = EXPORTS_DIR / f"auditoria_iva_{safe_tipo}_{stamp}.pdf"
+    excel_name = f"auditoria_iva_{safe_tipo}_{metadata.get('periodo','').replace('/','_')}_{stamp}.xlsx"
+    pdf_name = f"auditoria_iva_{safe_tipo}_{metadata.get('periodo','').replace('/','_')}_{stamp}.pdf"
+    excel_path = EXPORTS_DIR / excel_name
+    pdf_path = EXPORTS_DIR / pdf_name
     excel_path.write_bytes(excel_bytes)
     if pdf_bytes:
         pdf_path.write_bytes(pdf_bytes)
-    metrics = result["metrics"]
+    metrics = result.get("metrics", {})
     item = {
         "id": stamp,
         "timestamp": metadata.get("timestamp"),
@@ -1125,55 +1172,124 @@ def save_run_to_history(result: Dict[str, Any], metadata: Dict[str, Any], excel_
         "sociedad": metadata.get("sociedad"),
         "cuit": metadata.get("cuit"),
         "periodo": metadata.get("periodo"),
-        "tipo_auditoria": result["tipo_auditoria"],
+        "tipo_auditoria": result.get("tipo_auditoria"),
         "archivo_afip": metadata.get("archivo_afip"),
         "archivo_libro": metadata.get("archivo_libro"),
         "excel_path": str(excel_path),
         "pdf_path": str(pdf_path) if pdf_bytes else "",
+        "excel_name": excel_name,
+        "pdf_name": pdf_name if pdf_bytes else "",
+        "excel_b64": _bytes_to_b64(excel_bytes),
+        "pdf_b64": _bytes_to_b64(pdf_bytes),
         "metrics": metrics,
+        "estado_general": "REVISAR" if metrics.get("observados", 0) or abs(float(metrics.get("diferencia_neta", 0) or 0)) > TOLERANCIA_DEFAULT else "OK",
     }
     hist = load_history()
     hist.insert(0, item)
-    save_history(hist[:300])
+    save_history(hist)
     return item
 
 
-def render_history():
-    st.sidebar.subheader("Historial")
-    hist = load_history()
-    if not hist:
-        st.sidebar.caption("Todavía no hay auditorías guardadas.")
-        return
-    for item in hist[:25]:
-        label = f"{item.get('timestamp','')} · {item.get('tipo_auditoria','')} · {item.get('periodo','')}"
-        with st.sidebar.expander(label):
-            st.write(f"**Sociedad:** {item.get('sociedad','')}")
-            st.write(f"**Usuario:** {item.get('usuario','')}")
-            m = item.get("metrics", {})
-            st.write(f"**Dif. neta:** {fmt_money(m.get('diferencia_neta',0))}")
-            st.write(f"**Dif. bruta:** {fmt_money(m.get('diferencia_bruta',0))}")
-            excel_path = item.get("excel_path")
-            pdf_path = item.get("pdf_path")
-            if excel_path and Path(excel_path).exists():
+def history_label(record: Dict[str, Any], idx: int) -> str:
+    periodo = record.get("periodo") or "sin período"
+    sociedad = record.get("sociedad") or "sin sociedad"
+    tipo = record.get("tipo_auditoria") or "sin tipo"
+    fecha = record.get("timestamp") or "sin fecha"
+    return f"{idx + 1}. {periodo} · {sociedad} · {tipo} · {fecha}"
+
+
+def history_to_dataframe(history: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for r in history:
+        m = r.get("metrics", {}) or {}
+        rows.append({
+            "Período": r.get("periodo", ""),
+            "Fecha guardado": r.get("timestamp", ""),
+            "Sociedad": r.get("sociedad", ""),
+            "CUIT": r.get("cuit", ""),
+            "Tipo auditoría": r.get("tipo_auditoria", ""),
+            "Estado": r.get("estado_general", ""),
+            "IVA AFIP": m.get("iva_afip", m.get("iva_afip_firmado", "")),
+            "IVA Libro": m.get("iva_libro", m.get("iva_computado_libro_mes", "")),
+            "Dif. neta": m.get("diferencia_neta", ""),
+            "Dif. bruta": m.get("diferencia_bruta", ""),
+            "OK": m.get("ok", ""),
+            "Sólo AFIP": m.get("solo_afip", ""),
+            "Sólo Libro": m.get("solo_libro", ""),
+            "IVA distinto": m.get("iva_distinto", ""),
+            "Archivo AFIP": r.get("archivo_afip", ""),
+            "Archivo Libro": r.get("archivo_libro", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def _history_downloads_ui(history: List[Dict[str, Any]]):
+    st.markdown("#### Descargar archivos guardados")
+    for i, r in enumerate(history):
+        label = history_label(r, i)
+        excel_bytes = _b64_to_bytes(r.get("excel_b64")) or _read_file_if_exists(r.get("excel_path"))
+        pdf_bytes = _b64_to_bytes(r.get("pdf_b64")) or _read_file_if_exists(r.get("pdf_path"))
+        excel_name = r.get("excel_name") or (Path(str(r.get("excel_path"))).name if r.get("excel_path") else f"auditoria_{i+1}.xlsx")
+        pdf_name = r.get("pdf_name") or (Path(str(r.get("pdf_path"))).name if r.get("pdf_path") else f"auditoria_{i+1}.pdf")
+        c0, c1, c2 = st.columns([3.2, 1, 1])
+        with c0:
+            st.write(label)
+        with c1:
+            if excel_bytes:
                 st.download_button(
-                    "Descargar Excel",
-                    data=Path(excel_path).read_bytes(),
-                    file_name=Path(excel_path).name,
+                    "⬇️ Excel",
+                    data=excel_bytes,
+                    file_name=excel_name,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"hist_xlsx_{item.get('id')}",
+                    key=f"hist_excel_{i}_{r.get('id','')}",
+                    use_container_width=True,
                 )
             else:
                 st.caption("Excel no disponible")
-            if pdf_path and Path(pdf_path).exists():
+        with c2:
+            if pdf_bytes:
                 st.download_button(
-                    "Descargar PDF",
-                    data=Path(pdf_path).read_bytes(),
-                    file_name=Path(pdf_path).name,
+                    "⬇️ PDF",
+                    data=pdf_bytes,
+                    file_name=pdf_name,
                     mime="application/pdf",
-                    key=f"hist_pdf_{item.get('id')}",
+                    key=f"hist_pdf_{i}_{r.get('id','')}",
+                    use_container_width=True,
                 )
             else:
                 st.caption("PDF no disponible")
+
+
+def render_history_panel():
+    """Historial principal, estilo app Sueldos: tabla, descargas y administración."""
+    with st.expander("Historial guardado", expanded=False):
+        hist = load_history()
+        if not hist:
+            st.info("Todavía no hay auditorías guardadas.")
+            return
+        hist_df = history_to_dataframe(hist)
+        st.dataframe(hist_df, use_container_width=True)
+        _history_downloads_ui(hist)
+        st.markdown("#### Administrar historial")
+        selected_delete = st.multiselect(
+            "Seleccioná registros para eliminar",
+            options=list(range(len(hist))),
+            format_func=lambda i: history_label(hist[i], i),
+        )
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if st.button("Eliminar seleccionados", disabled=not selected_delete):
+                delete_set = set(selected_delete)
+                remaining = [r for i, r in enumerate(hist) if i not in delete_set]
+                save_history(remaining)
+                st.success("Registros eliminados.")
+                st.rerun()
+        with c2:
+            confirm_clear = st.checkbox("Confirmo borrar todo el historial")
+            if st.button("Borrar todo el historial", disabled=not confirm_clear):
+                save_history([])
+                st.success("Historial eliminado.")
+                st.rerun()
 
 # =============================================================================
 # UI
@@ -1230,22 +1346,27 @@ def render_metrics(result: Dict[str, Any]):
     c12.metric("IVA distinto", m.get("iva_distinto", 0))
 
 def main():
+    st.set_page_config(page_title=APP_TITLE, page_icon="🧾", layout="wide")
     if not login_required():
         return
 
-    st.set_page_config(page_title=APP_TITLE, page_icon="🧾", layout="wide")
     st.title(f"{APP_TITLE} · {APP_VERSION}")
     st.caption("Auditoría de comprobantes y validación del IVA mensual")
-    render_history()
 
     with st.sidebar:
-        st.subheader("Configuración")
-        sociedad = st.selectbox("Sociedad", SOCIEDADES_DEFAULT)
-        cuit_sociedad = st.text_input("CUIT sociedad", value="30-71142417-9")
+        st.header("Sociedad")
+        sociedad = st.radio("Elegí una sociedad", SOCIEDADES_DEFAULT, index=2)
+        default_cuit = SOCIEDADES_CONFIG.get(sociedad, "")
+        cuit_sociedad = st.text_input("CUIT sociedad", value=default_cuit, key=f"cuit_sociedad_{sociedad}")
+        st.divider()
+        st.caption("Flujo: cargar archivos → elegir auditoría → revisar plan de acción → descargar/guardar historial.")
+        st.header("Período fiscal")
         today = datetime.today()
         year = st.number_input("Año fiscal", min_value=2020, max_value=2035, value=today.year, step=1)
         month = st.number_input("Mes fiscal", min_value=1, max_value=12, value=today.month, step=1)
         tolerancia = st.number_input("Tolerancia diferencias ($)", min_value=0.0, value=TOLERANCIA_DEFAULT, step=0.01, format="%.2f")
+
+    render_history_panel()
 
     st.subheader("Paso 1 · Cargar archivos")
     col_a, col_b = st.columns(2)
