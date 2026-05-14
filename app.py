@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Auditor IVA - AFIP/ARCA vs Libro IVA Sistema
-Grupo Dancona / Auditorías
-Versión v4.0
+Auditorías
+Versión v5.1
 
 Dos auditorías separadas:
 1) Auditoría de Comprobantes: existencia documental por CUIT + Tipo + PV + Número.
@@ -39,17 +39,18 @@ except Exception:
     REPORTLAB_OK = False
 
 APP_TITLE = "Auditor IVA"
-APP_VERSION = "v4.0"
+APP_VERSION = "v5.1"
 HIST_FILE = Path("historial_auditor_iva.json")
 EXPORTS_DIR = Path("exports")
 EXPORTS_DIR.mkdir(exist_ok=True)
 TOLERANCIA_DEFAULT = 0.01
 
-AUTH_USERS_DEFAULT = {}
+AUTH_USERS_DEFAULT: Dict[str, str] = {}
 SOCIEDADES_DEFAULT = [
     "SIBI SA",
     "La Forza Gastronómica SAS",
     "La Stazione Gastronómica SAS",
+    "DANCONA ALIMENTOS",
 ]
 
 # =============================================================================
@@ -78,8 +79,11 @@ def login_required() -> bool:
     st.caption("Ingreso obligatorio")
     user = st.text_input("Usuario")
     pwd = st.text_input("Contraseña", type="password")
+    users = _get_auth_users()
+    if not users:
+        st.error("No hay usuarios configurados. Definí APP_USER y APP_PASSWORD en secrets antes de usar la app.")
+        return False
     if st.button("Ingresar", type="primary"):
-        users = _get_auth_users()
         if users.get(user) == pwd:
             st.session_state["auth_ok"] = True
             st.session_state["auth_user"] = user
@@ -664,6 +668,218 @@ def run_auditoria_iva_mes(afip: pd.DataFrame, libro: pd.DataFrame, year: int, mo
         "libro_fuera_periodo": fuera_periodo_libro,
     }
 
+
+# =============================================================================
+# Diagnóstico ejecutivo y plan de acción
+# =============================================================================
+
+MATERIALIDAD_REDONDEO_DEFAULT = 1.00
+
+
+def _first_not_empty(series: pd.Series) -> str:
+    for v in series.astype(str).tolist():
+        if v and v.lower() not in {"nan", "none", ""}:
+            return v
+    return ""
+
+
+def provider_display(cuit: Any, proveedor: Any) -> str:
+    name = str(proveedor or "").strip()
+    c = norm_cuit(cuit)
+    return f"{name} ({c})" if c else name
+
+
+def is_banco_nacion(row: pd.Series) -> bool:
+    txt = norm_text(f"{row.get('Proveedor','')} {row.get('CUIT','')}")
+    return "BANCO" in txt and ("NACION" in txt or "NAC ARGENTINA" in txt or "BNA" in txt)
+
+
+def is_servicio_publico(row: pd.Series) -> bool:
+    txt = norm_text(f"{row.get('Proveedor','')} {row.get('CUIT','')}")
+    keys = [
+        "EDEMSA", "EDEMSA", "COOP ELECTRICA", "COOPERATIVA ELECTRICA",
+        "AGUA Y SANEAMIENTO", "AYSAM", "GAS", "ECOGAS", "TELECOM", "MUNICIPALIDAD",
+    ]
+    return any(k in txt for k in keys)
+
+
+def categoria_solo_libro(row: pd.Series) -> str:
+    if is_banco_nacion(row):
+        return "Banco / operaciones recurrentes"
+    if is_servicio_publico(row):
+        return "Servicio público / posible desfase"
+    fecha = parse_date(row.get("Fecha_Comprobante"))
+    return "Verificar respaldo AFIP / comprobante" if fecha is not None else "Verificar fecha y respaldo"
+
+
+def _fmt_pv_num(pv: Any, num: Any) -> str:
+    p = str(pv or "").strip()
+    n = str(num or "").strip()
+    return f"{p}-{n}" if p else n
+
+
+def enrich_detalle_for_report(detalle: pd.DataFrame) -> pd.DataFrame:
+    if detalle is None or detalle.empty:
+        return pd.DataFrame()
+    df = detalle.copy()
+    df["Fecha"] = pd.to_datetime(df.get("Fecha_Comprobante"), errors="coerce").dt.strftime("%d/%m/%Y")
+    df["Fecha"] = df["Fecha"].fillna("")
+    if "PuntoVenta" in df.columns and "Numero" in df.columns:
+        df["Comprobante"] = df.apply(lambda r: _fmt_pv_num(r.get("PuntoVenta"), r.get("Numero")), axis=1)
+    return df
+
+
+def build_diagnostico_ejecutivo(result: Dict[str, Any], metadata: Dict[str, Any]) -> pd.DataFrame:
+    m = result["metrics"]
+    rows = []
+    if result["tipo_auditoria"] == "Auditoría de Comprobantes":
+        rows = [
+            ["Auditoría ejecutada", "Comprobantes", "Control documental de existencia por CUIT + Tipo + Punto de Venta + Número."],
+            ["Claves únicas AFIP / ARCA", m.get("claves_afip", 0), "Comprobantes normalizados detectados en la base externa."],
+            ["Claves únicas Libro IVA", m.get("claves_libro", 0), "Comprobantes normalizados detectados en el sistema."],
+            ["OK", m.get("ok", 0), "Existe en ambas fuentes y el IVA coincide dentro de tolerancia."],
+            ["Sólo AFIP / ARCA", m.get("solo_afip", 0), "Comprobantes recibidos no encontrados en Libro. Posible crédito fiscal omitido."],
+            ["Sólo Libro IVA", m.get("solo_libro", 0), "Comprobantes registrados en sistema no encontrados en AFIP. Revisar respaldo, carga o criterio de fecha."],
+            ["IVA distinto", m.get("iva_distinto", 0), "Misma clave, distinto IVA. Separar redondeos de diferencias materiales."],
+            ["Duplicados Libro", m.get("duplicados_libro", 0), "Riesgo de crédito fiscal duplicado si el mismo comprobante aparece más de una vez."],
+            ["Diferencia bruta documental", m.get("diferencia_bruta", 0), "Riesgo bruto antes de compensar positivos y negativos."],
+        ]
+    else:
+        rows = [
+            ["Auditoría ejecutada", "IVA del Mes", "Valida el IVA computado en el Libro del período usando AFIP como respaldo documental."],
+            ["IVA computado Libro del mes", m.get("iva_computado_libro_mes", 0), "Universo fiscal principal: el Libro IVA cargado para el período."],
+            ["IVA AFIP respaldado para comprobantes del Libro", m.get("iva_afip_encontrado_para_libro", 0), "IVA respaldado por comprobantes encontrados en AFIP."],
+            ["IVA Libro no encontrado en AFIP", m.get("iva_libro_no_encontrado_afip", 0), "Riesgo de crédito fiscal computado sin respaldo encontrado."],
+            ["IVA AFIP del mes no registrado", m.get("iva_afip_mes_no_registrado", 0), "Potencial crédito fiscal omitido o pendiente de registración."],
+            ["IVA con fecha fuera del período", m.get("iva_fuera_periodo_libro", 0), "Comprobantes registrados en el Libro del período pero con fecha visible distinta. Revisar fecha de recepción/registración y criterio fiscal."],
+            ["Diferencia neta", m.get("diferencia_neta", 0), "Impacto final compensado. No reemplaza la auditoría documental."],
+            ["Diferencia bruta no compensada", m.get("diferencia_bruta", 0), "Riesgo bruto real antes de compensaciones."],
+        ]
+    return pd.DataFrame(rows, columns=["Indicador", "Valor", "Interpretación contable"])
+
+
+def build_claude_style_sheets(result: Dict[str, Any], metadata: Dict[str, Any], materialidad_redondeo: float = MATERIALIDAD_REDONDEO_DEFAULT) -> Dict[str, pd.DataFrame]:
+    detalle = enrich_detalle_for_report(result.get("detalle", pd.DataFrame()))
+    sheets: Dict[str, pd.DataFrame] = {}
+    if detalle.empty:
+        return sheets
+
+    solo_afip = detalle[detalle["Estado"] == "SOLO_AFIP"].copy()
+    solo_libro = detalle[detalle["Estado"] == "SOLO_LIBRO"].copy()
+    iva_dist = detalle[detalle["Estado"] == "IVA_DISTINTO"].copy()
+
+    if not solo_afip.empty:
+        solo_afip["Diagnóstico / Acción"] = solo_afip.apply(
+            lambda r: f"Verificar recepción y registrar en sistema si corresponde. IVA AFIP no cargado: {fmt_money(r.get('IVA_AFIP', 0))}", axis=1
+        )
+        sheets["SOLO_AFIP - No en Libro"] = solo_afip[["CUIT", "Proveedor", "Tipo", "PuntoVenta", "Numero", "Fecha", "IVA_AFIP", "Diagnóstico / Acción"]].sort_values("IVA_AFIP", ascending=False)
+
+    if not solo_libro.empty:
+        solo_libro["Categoría"] = solo_libro.apply(categoria_solo_libro, axis=1)
+        solo_libro["Diagnóstico / Acción"] = solo_libro.apply(
+            lambda r: "Controlar respaldo masivo/resumen y criterio de carga" if is_banco_nacion(r) else ("Controlar factura física/servicio y fecha de recepción" if is_servicio_publico(r) else "Verificar respaldo AFIP, CUIT, tipo, punto de venta, número y período"), axis=1
+        )
+        sheets["SOLO_LIBRO - Analisis"] = solo_libro[["CUIT", "Proveedor", "Tipo", "PuntoVenta", "Numero", "Fecha", "IVA_Libro", "Categoría", "Diagnóstico / Acción"]].sort_values("IVA_Libro", ascending=False)
+
+    if not iva_dist.empty:
+        iva_dist["Materialidad"] = np.where(iva_dist["Diferencia"].abs() <= materialidad_redondeo, "Redondeo / centavos", "Diferencia material")
+        iva_dist["Acción"] = np.where(iva_dist["Materialidad"] == "Diferencia material", "Revisar alícuota/base imponible/carga manual", "Aceptar por tolerancia si política contable lo permite")
+        sheets["IVA Distinto"] = iva_dist[["CUIT", "Proveedor", "Tipo", "PuntoVenta", "Numero", "Fecha", "IVA_AFIP", "IVA_Libro", "Diferencia", "Materialidad", "Acción"]].sort_values("Diferencia", key=lambda s: s.abs(), ascending=False)
+
+    if result["tipo_auditoria"] == "Auditoría IVA del Mes":
+        fuera = result.get("libro_fuera_periodo", pd.DataFrame()).copy()
+        if fuera is not None and not fuera.empty:
+            fuera["Fecha"] = pd.to_datetime(fuera.get("Fecha_Comprobante"), errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
+            fuera["Período fecha comprobante"] = pd.to_datetime(fuera.get("Fecha_Comprobante"), errors="coerce").dt.strftime("%m/%Y").fillna("")
+            fuera["Acción"] = "Revisar fecha de recepción/registración y confirmar si corresponde computarlo en el período auditado. No rectificar automáticamente sin análisis contable."
+            sheets["Fechas Fuera de Periodo"] = fuera[["CUIT", "Proveedor", "Tipo", "PuntoVenta", "Numero", "Fecha", "IVA", "Período fecha comprobante", "Acción"]].sort_values("IVA", ascending=False)
+
+    return sheets
+
+
+def build_plan_accion(result: Dict[str, Any], metadata: Dict[str, Any], materialidad_redondeo: float = MATERIALIDAD_REDONDEO_DEFAULT) -> pd.DataFrame:
+    detalle = enrich_detalle_for_report(result.get("detalle", pd.DataFrame()))
+    rows: List[List[Any]] = []
+    idx = 1
+    if detalle.empty:
+        return pd.DataFrame(columns=["#", "Prioridad", "Acción", "Proveedor(es)", "IVA involucrado", "Responsable", "Estado"])
+
+    # 1) Faltantes AFIP por proveedor: prioridad urgente por impacto.
+    solo_afip = detalle[detalle["Estado"] == "SOLO_AFIP"].copy()
+    if not solo_afip.empty:
+        g = solo_afip.groupby(["CUIT", "Proveedor"], dropna=False).agg(
+            Cantidad=("Estado", "size"), IVA=("IVA_AFIP", "sum"), MinFecha=("Fecha", _first_not_empty),
+        ).reset_index().sort_values("IVA", ascending=False).head(10)
+        for _, r in g.iterrows():
+            prioridad = "URGENTE" if abs(r["IVA"]) >= 200000 else "MEDIA"
+            rows.append([
+                idx, prioridad,
+                f"Verificar comprobantes recibidos en AFIP que no están en Libro. Si corresponden al período, registrar o justificar la no registración. Cantidad: {int(r['Cantidad'])}.",
+                provider_display(r["CUIT"], r["Proveedor"]), float(r["IVA"]), "Pendiente", "Abierto"
+            ])
+            idx += 1
+
+    # 2) Sólo Libro no encontrado, excluyendo Banco Nación informativo pero dejando servicios públicos.
+    solo_libro = detalle[detalle["Estado"] == "SOLO_LIBRO"].copy()
+    if not solo_libro.empty:
+        solo_libro["EsBanco"] = solo_libro.apply(is_banco_nacion, axis=1)
+        solo_libro["EsServicioPublico"] = solo_libro.apply(is_servicio_publico, axis=1)
+        revisar = solo_libro[~solo_libro["EsBanco"]].copy()
+        if not revisar.empty:
+            g = revisar.groupby(["CUIT", "Proveedor"], dropna=False).agg(
+                Cantidad=("Estado", "size"), IVA=("IVA_Libro", "sum"),
+            ).reset_index().sort_values("IVA", ascending=False).head(8)
+            for _, r in g.iterrows():
+                prioridad = "MEDIA" if abs(r["IVA"]) >= 100000 else "BAJA"
+                rows.append([
+                    idx, prioridad,
+                    f"Comprobantes registrados en Libro no encontrados en AFIP. Revisar respaldo, CUIT, tipo, punto de venta, número y período. Cantidad: {int(r['Cantidad'])}.",
+                    provider_display(r["CUIT"], r["Proveedor"]), float(r["IVA"]), "Pendiente", "Abierto"
+                ])
+                idx += 1
+        banco = solo_libro[solo_libro["EsBanco"]]
+        if not banco.empty:
+            rows.append([
+                idx, "INFO",
+                "Operaciones bancarias/recurrentes no encontradas individualmente en AFIP. Mantener control de respaldo masivo, resúmenes y criterio contable; no tratarlas como faltantes comerciales comunes.",
+                "Banco Nación / operaciones bancarias", float(banco["IVA_Libro"].sum()), "Contabilidad", "Control periódico"
+            ])
+            idx += 1
+
+    # 3) IVA distinto material.
+    iva_dist = detalle[detalle["Estado"] == "IVA_DISTINTO"].copy()
+    if not iva_dist.empty:
+        mat = iva_dist[iva_dist["Diferencia"].abs() > materialidad_redondeo].sort_values("Diferencia", key=lambda s: s.abs(), ascending=False)
+        if not mat.empty:
+            for _, r in mat.head(5).iterrows():
+                rows.append([
+                    idx, "MEDIA",
+                    f"Mismo comprobante con IVA distinto. Revisar base imponible, alícuota, exentos/percepciones o carga manual. Comp.: {_fmt_pv_num(r.get('PuntoVenta'), r.get('Numero'))}.",
+                    provider_display(r.get("CUIT"), r.get("Proveedor")), float(r.get("Diferencia", 0)), "Pendiente", "Abierto"
+                ])
+                idx += 1
+        redondeos = iva_dist[iva_dist["Diferencia"].abs() <= materialidad_redondeo]
+        if not redondeos.empty:
+            rows.append([
+                idx, "BAJA",
+                f"Separar {len(redondeos)} diferencias de centavos/redondeo. No mezclarlas con diferencias materiales; definir tolerancia de aceptación.",
+                "Varios", float(redondeos["Diferencia"].abs().sum()), "Contabilidad", "Pendiente criterio"
+            ])
+            idx += 1
+
+    # 4) Fechas fuera del período, sólo para IVA del Mes.
+    if result["tipo_auditoria"] == "Auditoría IVA del Mes":
+        fuera = result.get("libro_fuera_periodo", pd.DataFrame())
+        if fuera is not None and not fuera.empty:
+            rows.append([
+                idx, "BAJA",
+                "Comprobantes del Libro con fecha visible fuera del período. Revisar fecha de recepción/registración y confirmar criterio de cómputo. No definir rectificativa automática sin análisis del contador.",
+                "Varios", float(fuera.get("IVA", pd.Series(dtype=float)).sum()), "Contabilidad", "Revisar criterio"
+            ])
+            idx += 1
+
+    return pd.DataFrame(rows, columns=["#", "Prioridad", "Acción", "Proveedor(es)", "IVA involucrado", "Responsable", "Estado"])
+
 # =============================================================================
 # Exportaciones
 # =============================================================================
@@ -713,89 +929,111 @@ def write_df(ws, df: pd.DataFrame, start_row: int = 1, start_col: int = 1, title
 
 
 def export_excel(result: Dict[str, Any], metadata: Dict[str, Any]) -> bytes:
+    """Exporta un informe más parecido a una auditoría profesional:
+    Resumen Ejecutivo, hojas de observaciones por categoría y Plan de Acción.
+    """
     wb = Workbook()
     ws = wb.active
-    ws.title = "Resumen"
-    ws["A1"] = "Auditor IVA"
-    ws["A1"].font = Font(bold=True, size=16)
-    ws["A2"] = f"Tipo: {result['tipo_auditoria']}"
-    ws["A3"] = f"Sociedad: {metadata.get('sociedad','')}"
-    ws["A4"] = f"CUIT: {metadata.get('cuit','')}"
-    ws["A5"] = f"Período fiscal: {metadata.get('periodo','')}"
-    ws["A6"] = f"Usuario: {metadata.get('usuario','')}"
-    ws["A7"] = f"Generado: {metadata.get('timestamp','')}"
+    ws.title = "Resumen Ejecutivo"
 
-    metrics = result["metrics"]
-    if result["tipo_auditoria"] == "Auditoría de Comprobantes":
-        rows = [
-            ("Auditoría ejecutada", "Control documental por comprobante"),
-            ("Claves únicas AFIP / ARCA", metrics.get("claves_afip", 0)),
-            ("Claves únicas Libro IVA", metrics.get("claves_libro", 0)),
-            ("Comprobantes OK", metrics.get("ok", 0)),
-            ("Comprobantes observados", metrics.get("observados", 0)),
-            ("Sólo AFIP / ARCA", metrics.get("solo_afip", 0)),
-            ("Sólo Libro IVA", metrics.get("solo_libro", 0)),
-            ("Mismo comprobante con IVA distinto", metrics.get("iva_distinto", 0)),
-            ("Duplicados AFIP", metrics.get("duplicados_afip", 0)),
-            ("Duplicados Libro", metrics.get("duplicados_libro", 0)),
-            ("IVA en AFIP no cargado en Libro", metrics.get("iva_solo_afip", 0)),
-            ("IVA en Libro sin respaldo AFIP", metrics.get("iva_solo_libro", 0)),
-            ("Diferencia IVA en comprobantes encontrados", metrics.get("iva_diferencia_mismo_comprobante", 0)),
-            ("Diferencia bruta documental", metrics.get("diferencia_bruta", 0)),
-        ]
-    else:
-        rows = [
-            ("Auditoría ejecutada", "Validación fiscal del IVA computado en el mes"),
-            ("IVA computado Libro del mes", metrics.get("iva_computado_libro_mes", 0)),
-            ("IVA AFIP respaldado para comprobantes del Libro", metrics.get("iva_afip_encontrado_para_libro", 0)),
-            ("IVA Libro no encontrado en AFIP", metrics.get("iva_libro_no_encontrado_afip", 0)),
-            ("IVA AFIP del mes no registrado", metrics.get("iva_afip_mes_no_registrado", 0)),
-            ("IVA Libro con fecha comprobante fuera del período", metrics.get("iva_fuera_periodo_libro", 0)),
-            ("Cantidad Libro fuera del período", metrics.get("comprobantes_fuera_periodo_libro", 0)),
-            ("Diferencia neta Libro - AFIP", metrics.get("diferencia_neta", 0)),
-            ("Diferencias positivas", metrics.get("diferencias_positivas", 0)),
-            ("Diferencias negativas", metrics.get("diferencias_negativas", 0)),
-            ("Diferencia bruta no compensada", metrics.get("diferencia_bruta", 0)),
-            ("Comprobantes OK", metrics.get("ok", 0)),
-            ("Sólo AFIP / ARCA", metrics.get("solo_afip", 0)),
-            ("Sólo Libro IVA", metrics.get("solo_libro", 0)),
-            ("IVA distinto", metrics.get("iva_distinto", 0)),
-            ("Duplicados Libro", metrics.get("duplicados_libro", 0)),
-        ]
-    summary_df = pd.DataFrame(rows, columns=["Indicador", "Valor"])
-    write_df(ws, summary_df, start_row=10)
+    title_fill = PatternFill("solid", fgColor="1F4E78")
+    section_fill = PatternFill("solid", fgColor="D9EAF7")
+    warning_fill = PatternFill("solid", fgColor="FCE4D6")
+    ok_fill = PatternFill("solid", fgColor="E2F0D9")
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Side(border_style="thin", color="D9E2F3")
 
-    sheets = {
+    ws.merge_cells("A1:D1")
+    ws["A1"] = f"AUDITORÍA IVA — {metadata.get('sociedad','')} | PERÍODO {metadata.get('periodo','')}"
+    ws["A1"].font = Font(bold=True, size=15, color="FFFFFF")
+    ws["A1"].fill = title_fill
+    ws["A1"].alignment = Alignment(horizontal="center")
+    ws.merge_cells("A2:D2")
+    ws["A2"] = f"CUIT: {metadata.get('cuit','')}  |  Usuario: {metadata.get('usuario','')}  |  Generado: {metadata.get('timestamp','')}"
+    ws["A2"].font = Font(italic=True, color="666666")
+
+    ws["A4"] = "INDICADORES CLAVE"
+    ws["A4"].font = Font(bold=True, size=12)
+    ws["A4"].fill = section_fill
+    ws.merge_cells("A4:D4")
+
+    diag = build_diagnostico_ejecutivo(result, metadata)
+    write_df(ws, diag, start_row=5)
+
+    # Diagnóstico corto por categoría.
+    base_row = 5 + len(diag) + 3
+    ws.cell(base_row, 1, "DIAGNÓSTICO CONTABLE").font = Font(bold=True, size=12)
+    ws.cell(base_row, 1).fill = section_fill
+    ws.merge_cells(start_row=base_row, start_column=1, end_row=base_row, end_column=4)
+    m = result["metrics"]
+    diagnostic_rows = [
+        ["Diferencia neta", fmt_money(m.get("diferencia_neta", 0)), "Resultado compensado: no debe usarse como única conclusión."],
+        ["Diferencia bruta", fmt_money(m.get("diferencia_bruta", 0)), "Mide el volumen real de diferencias antes de compensar."],
+        ["Sólo AFIP", f"{m.get('solo_afip', 0)} comp. | {fmt_money(m.get('iva_solo_afip', 0))}", "Posibles comprobantes no registrados o crédito fiscal omitido."],
+        ["Sólo Libro", f"{m.get('solo_libro', 0)} comp. | {fmt_money(m.get('iva_solo_libro', 0))}", "Revisar respaldo, datos de carga y criterio de período."],
+        ["IVA distinto", f"{m.get('iva_distinto', 0)} comp. | {fmt_money(m.get('iva_diferencia_mismo_comprobante_abs', 0))}", "Separar diferencias materiales de redondeos."],
+    ]
+    write_df(ws, pd.DataFrame(diagnostic_rows, columns=["Categoría", "Valor", "Lectura / Riesgo"]), start_row=base_row + 1)
+
+    # Hojas estilo informe externo.
+    sheets = build_claude_style_sheets(result, metadata)
+    sheets["Plan de Acción"] = build_plan_accion(result, metadata)
+
+    # Hojas técnicas originales al final para trazabilidad completa.
+    sheets.update({
         "Resumen por Estado": result.get("resumen_estado", pd.DataFrame()),
         "Diferencias por CUIT": result.get("resumen_proveedor", pd.DataFrame()),
         "Detalle Comprobantes": result.get("detalle", pd.DataFrame()),
         "Duplicados": result.get("duplicados", pd.DataFrame()),
         "AFIP Normalizado": result.get("afip_norm", pd.DataFrame()),
         "Libro Normalizado": result.get("libro_norm", pd.DataFrame()),
-    }
+    })
     if result["tipo_auditoria"] == "Auditoría IVA del Mes":
-        control_mes = pd.DataFrame([
-            ["Universo fiscal", "Libro IVA cargado para el período", "No se excluyen comprobantes por fecha visible; se informan como alerta."],
-            ["IVA computado por Libro", metrics.get("iva_computado_libro_mes", 0), "Total del Libro IVA normalizado."],
-            ["IVA Libro no encontrado en AFIP", metrics.get("iva_libro_no_encontrado_afip", 0), "Riesgo de crédito fiscal computado sin respaldo encontrado."],
-            ["IVA AFIP del mes no registrado", metrics.get("iva_afip_mes_no_registrado", 0), "Potencial comprobante omitido en el Libro del período."],
-            ["IVA con fecha fuera del período", metrics.get("iva_fuera_periodo_libro", 0), "Comprobantes registrados en el Libro del período pero con fecha de comprobante anterior/posterior."],
-        ], columns=["Control", "Valor", "Interpretación contable"])
-        sheets["Control IVA del Mes"] = control_mes
         sheets["AFIP Mes no Registrado"] = result.get("afip_mes_no_registrado", pd.DataFrame())
         sheets["Libro Fuera Periodo"] = result.get("libro_fuera_periodo", pd.DataFrame())
 
     for name, df in sheets.items():
         wsx = wb.create_sheet(name[:31])
         if df is not None and not df.empty:
-            write_df(wsx, df.reset_index(drop=True))
+            title = None
+            if name == "Plan de Acción":
+                title = f"PLAN DE ACCIÓN — {metadata.get('sociedad','')} — {metadata.get('periodo','')}"
+            write_df(wsx, df.reset_index(drop=True), title=title)
+            # Formato especial para prioridad en Plan de Acción.
+            if name == "Plan de Acción":
+                wsx.freeze_panes = "A3"
+                for row in range(3, wsx.max_row + 1):
+                    val = str(wsx.cell(row, 2).value or "").upper()
+                    if val == "URGENTE":
+                        fill = PatternFill("solid", fgColor="F4CCCC")
+                    elif val == "MEDIA":
+                        fill = PatternFill("solid", fgColor="FFF2CC")
+                    elif val == "BAJA":
+                        fill = PatternFill("solid", fgColor="D9EAF7")
+                    else:
+                        fill = PatternFill("solid", fgColor="E2F0D9")
+                    for col in range(1, min(wsx.max_column, 7) + 1):
+                        wsx.cell(row, col).fill = fill
         else:
             wsx["A1"] = "Sin datos"
+        auto_width(wsx)
 
+    for sh in wb.worksheets:
+        try:
+            sh.freeze_panes = "A2" if sh.title != "Resumen Ejecutivo" else "A5"
+        except Exception:
+            pass
+        for row in sh.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, (int, float)) and ("IVA" in str(sh.title).upper() or cell.column >= 5):
+                    cell.number_format = '#,##0.00'
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    auto_width(ws)
     bio = BytesIO()
     wb.save(bio)
     return bio.getvalue()
-
 
 def export_pdf(result: Dict[str, Any], metadata: Dict[str, Any]) -> Optional[bytes]:
     if not REPORTLAB_OK:
@@ -850,7 +1088,7 @@ def export_pdf(result: Dict[str, Any], metadata: Dict[str, Any]) -> Optional[byt
     ]))
     story.append(tbl)
     story.append(Spacer(1, 0.4*cm))
-    story.append(Paragraph("Nota: el PDF es ejecutivo. El detalle completo queda en el Excel de auditoría.", styles["Italic"]))
+    story.append(Paragraph("Nota: el PDF es ejecutivo. El Excel incluye Resumen Ejecutivo, observaciones por categoría y Plan de Acción.", styles["Italic"]))
     doc.build(story)
     return bio.getvalue()
 
@@ -1070,6 +1308,12 @@ def main():
 
     st.subheader(f"Resultado · {result['tipo_auditoria']}")
     render_metrics(result)
+
+    st.subheader("Diagnóstico ejecutivo y plan de acción")
+    diag_df = build_diagnostico_ejecutivo(result, metadata={"sociedad": sociedad, "periodo": f"{int(month):02d}/{int(year)}"})
+    st.dataframe(diag_df, use_container_width=True)
+    plan_df = build_plan_accion(result, metadata={"sociedad": sociedad, "periodo": f"{int(month):02d}/{int(year)}"})
+    st.dataframe(plan_df, use_container_width=True)
 
     if result["tipo_auditoria"] == "Auditoría IVA del Mes":
         tab0, tab1, tab2, tab3, tab4 = st.tabs(["Control IVA del Mes", "Resumen por estado", "Diferencias por proveedor", "Detalle comprobantes", "Alertas del período"])
