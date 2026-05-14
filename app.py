@@ -2,7 +2,7 @@
 """
 Auditor IVA - AFIP/ARCA vs Libro IVA Sistema
 Auditorías
-Versión v5.1
+Versión v5.3 multimes
 
 Dos auditorías separadas:
 1) Auditoría de Comprobantes: existencia documental por CUIT + Tipo + PV + Número.
@@ -40,7 +40,7 @@ except Exception:
     REPORTLAB_OK = False
 
 APP_TITLE = "Auditor IVA"
-APP_VERSION = "v5.2"
+APP_VERSION = "v5.3"
 HIST_FILE = Path("historial_auditor_iva.json")
 EXPORTS_DIR = Path("exports")
 EXPORTS_DIR.mkdir(exist_ok=True)
@@ -511,6 +511,78 @@ def normalize_libro(raw: pd.DataFrame) -> pd.DataFrame:
         return parse_libro_flexxus_layout(raw)
     except Exception:
         return parse_libro_tabular(raw)
+
+def normalize_uploaded_files(files: List[Any], source_kind: str) -> pd.DataFrame:
+    """Lee y normaliza uno o varios archivos de una misma fuente.
+
+    source_kind:
+    - "AFIP" para Mis Comprobantes.
+    - "LIBRO" para Libro IVA del sistema.
+
+    Devuelve un único DataFrame concatenado, conservando el nombre del archivo
+    origen en la columna Archivo_Origen. Esto permite auditar varios meses en
+    una sola corrida y mantener trazabilidad por archivo.
+    """
+    frames: List[pd.DataFrame] = []
+    errors: List[str] = []
+    for uploaded in files or []:
+        name = getattr(uploaded, "name", "archivo_sin_nombre")
+        try:
+            raw = read_uploaded_file(uploaded)
+            norm_df = normalize_afip(raw) if source_kind.upper() == "AFIP" else normalize_libro(raw)
+            norm_df = norm_df.copy()
+            norm_df["Archivo_Origen"] = name
+            frames.append(norm_df)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+    if errors:
+        raise ValueError("No se pudieron procesar uno o más archivos:\n" + "\n".join(errors))
+    if not frames:
+        raise ValueError("No se cargaron archivos válidos para normalizar.")
+    out = pd.concat(frames, ignore_index=True)
+    if "Fecha_Comprobante" in out.columns:
+        out["Periodo_Comprobante"] = pd.to_datetime(out["Fecha_Comprobante"], errors="coerce").dt.strftime("%m/%Y")
+        out["Periodo_Comprobante"] = out["Periodo_Comprobante"].fillna("")
+    return out
+
+
+def file_names_label(files: List[Any]) -> str:
+    names = [getattr(f, "name", "archivo_sin_nombre") for f in files or []]
+    return ", ".join(names)
+
+
+def run_auditoria_iva_consolidada(afip: pd.DataFrame, libro: pd.DataFrame, tolerancia: float) -> Dict[str, Any]:
+    """Auditoría fiscal multiperíodo/consolidada.
+
+    Se usa cuando el usuario carga varios meses juntos. No aplica filtro por
+    mes/año, por lo que evita falsas alertas de "fuera de período" cuando el
+    objetivo es auditar todos los archivos cargados como un único universo.
+    """
+    base = run_auditoria_comprobantes(afip, libro, tolerancia)
+    detalle = base["detalle"].copy()
+    metrics = dict(base["metrics"])
+    metrics.update({
+        "iva_computado_libro_mes": float(libro["IVA"].sum()),
+        "iva_afip_encontrado_para_libro": float(detalle.loc[detalle["Estado"].isin(["OK", "IVA_DISTINTO"]), "IVA_AFIP"].sum()),
+        "iva_libro_no_encontrado_afip": float(detalle.loc[detalle["Estado"] == "SOLO_LIBRO", "IVA_Libro"].sum()),
+        "iva_afip_mes_no_registrado": float(detalle.loc[detalle["Estado"] == "SOLO_AFIP", "IVA_AFIP"].sum()),
+        "comprobantes_fuera_periodo_libro": 0,
+        "iva_fuera_periodo_libro": 0.0,
+        "afip_mes_no_registrado_cantidad": int((detalle["Estado"] == "SOLO_AFIP").sum()),
+        "modo_periodo": "Consolidado multiperíodo",
+    })
+    return {
+        "tipo_auditoria": "Auditoría IVA del Mes",
+        "metrics": metrics,
+        "detalle": detalle,
+        "resumen_estado": base["resumen_estado"],
+        "resumen_proveedor": base["resumen_proveedor"],
+        "duplicados": base["duplicados"],
+        "afip_norm": afip,
+        "libro_norm": libro,
+        "afip_mes_no_registrado": detalle[detalle["Estado"] == "SOLO_AFIP"].copy(),
+        "libro_fuera_periodo": pd.DataFrame(),
+    }
 
 # =============================================================================
 # Auditorías
@@ -1175,6 +1247,8 @@ def save_run_to_history(result: Dict[str, Any], metadata: Dict[str, Any], excel_
         "tipo_auditoria": result.get("tipo_auditoria"),
         "archivo_afip": metadata.get("archivo_afip"),
         "archivo_libro": metadata.get("archivo_libro"),
+        "cantidad_archivos_afip": metadata.get("cantidad_archivos_afip"),
+        "cantidad_archivos_libro": metadata.get("cantidad_archivos_libro"),
         "excel_path": str(excel_path),
         "pdf_path": str(pdf_path) if pdf_bytes else "",
         "excel_name": excel_name,
@@ -1217,6 +1291,8 @@ def history_to_dataframe(history: List[Dict[str, Any]]) -> pd.DataFrame:
             "Sólo AFIP": m.get("solo_afip", ""),
             "Sólo Libro": m.get("solo_libro", ""),
             "IVA distinto": m.get("iva_distinto", ""),
+            "Archivos AFIP": r.get("cantidad_archivos_afip", 1 if r.get("archivo_afip") else ""),
+            "Archivos Libro": r.get("cantidad_archivos_libro", 1 if r.get("archivo_libro") else ""),
             "Archivo AFIP": r.get("archivo_afip", ""),
             "Archivo Libro": r.get("archivo_libro", ""),
         })
@@ -1361,9 +1437,25 @@ def main():
         st.divider()
         st.caption("Flujo: cargar archivos → elegir auditoría → revisar plan de acción → descargar/guardar historial.")
         st.header("Período fiscal")
+        alcance_periodo = st.radio(
+            "Alcance",
+            ["Mes seleccionado", "Varios meses / consolidado"],
+            index=0,
+            help=(
+                "Mes seleccionado: valida un período fiscal puntual. "
+                "Varios meses/consolidado: permite cargar varios archivos por sección y auditar todo junto."
+            ),
+        )
         today = datetime.today()
-        year = st.number_input("Año fiscal", min_value=2020, max_value=2035, value=today.year, step=1)
-        month = st.number_input("Mes fiscal", min_value=1, max_value=12, value=today.month, step=1)
+        if alcance_periodo == "Mes seleccionado":
+            year = st.number_input("Año fiscal", min_value=2020, max_value=2035, value=today.year, step=1)
+            month = st.number_input("Mes fiscal", min_value=1, max_value=12, value=today.month, step=1)
+            periodo_label = f"{int(month):02d}/{int(year)}"
+        else:
+            year = today.year
+            month = today.month
+            periodo_label = "MULTIPERIODO"
+            st.caption("Modo consolidado: la app no excluye ni alerta por fecha fuera del mes, porque el universo son todos los archivos cargados.")
         tolerancia = st.number_input("Tolerancia diferencias ($)", min_value=0.0, value=TOLERANCIA_DEFAULT, step=0.01, format="%.2f")
 
     render_history_panel()
@@ -1371,34 +1463,46 @@ def main():
     st.subheader("Paso 1 · Cargar archivos")
     col_a, col_b = st.columns(2)
     with col_a:
-        afip_file = st.file_uploader("Archivo AFIP / ARCA - Mis Comprobantes", type=["xlsx", "xls", "csv"])
+        afip_files = st.file_uploader(
+            "Archivo/s AFIP / ARCA - Mis Comprobantes",
+            type=["xlsx", "xls", "csv"],
+            accept_multiple_files=True,
+            help="Podés cargar uno o varios archivos AFIP. La app los consolida y conserva el nombre de origen.",
+        )
     with col_b:
-        libro_file = st.file_uploader("Libro IVA del sistema", type=["xlsx", "xls", "csv"])
+        libro_files = st.file_uploader(
+            "Libro/s IVA del sistema",
+            type=["xlsx", "xls", "csv"],
+            accept_multiple_files=True,
+            help="Podés cargar uno o varios Libros IVA. Útil para auditar varios meses en una sola corrida.",
+        )
 
-    if not afip_file or not libro_file:
-        st.warning("Cargá ambos archivos para ejecutar la auditoría.")
+    if not afip_files or not libro_files:
+        st.warning("Cargá al menos un archivo AFIP/ARCA y al menos un Libro IVA para ejecutar la auditoría.")
         return
 
     try:
-        afip_raw = read_uploaded_file(afip_file)
-        libro_raw = read_uploaded_file(libro_file)
-        afip_norm = normalize_afip(afip_raw)
-        libro_norm = normalize_libro(libro_raw)
+        afip_norm = normalize_uploaded_files(afip_files, "AFIP")
+        libro_norm = normalize_uploaded_files(libro_files, "LIBRO")
     except Exception as e:
         st.error(f"No se pudo procesar alguno de los archivos: {e}")
         st.stop()
 
-    st.success("Archivos leídos y normalizados correctamente.")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Comprobantes AFIP", len(afip_norm))
-    c2.metric("Comprobantes Libro", len(libro_norm))
-    c3.metric("IVA AFIP firmado", fmt_money(afip_norm["IVA"].sum()))
-    c4.metric("IVA Libro firmado", fmt_money(libro_norm["IVA"].sum()))
+    st.success("Archivos leídos, consolidados y normalizados correctamente.")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Archivos AFIP", len(afip_files))
+    c2.metric("Archivos Libro", len(libro_files))
+    c3.metric("Comprobantes AFIP", len(afip_norm))
+    c4.metric("Comprobantes Libro", len(libro_norm))
+    c5.metric("IVA AFIP firmado", fmt_money(afip_norm["IVA"].sum()))
+    c6.metric("IVA Libro firmado", fmt_money(libro_norm["IVA"].sum()))
 
     with st.expander("Ver muestra normalizada"):
         st.write("AFIP / ARCA")
+        st.caption(file_names_label(afip_files))
         st.dataframe(afip_norm.head(50), use_container_width=True)
         st.write("Libro IVA")
+        st.caption(file_names_label(libro_files))
         st.dataframe(libro_norm.head(50), use_container_width=True)
 
     st.subheader("Paso 2 · Elegir auditoría")
@@ -1425,15 +1529,18 @@ def main():
     if tipo_seleccionado == "Auditoría de Comprobantes":
         result = run_auditoria_comprobantes(afip_norm, libro_norm, tolerancia)
     else:
-        result = run_auditoria_iva_mes(afip_norm, libro_norm, int(year), int(month), tolerancia)
+        if alcance_periodo == "Varios meses / consolidado":
+            result = run_auditoria_iva_consolidada(afip_norm, libro_norm, tolerancia)
+        else:
+            result = run_auditoria_iva_mes(afip_norm, libro_norm, int(year), int(month), tolerancia)
 
     st.subheader(f"Resultado · {result['tipo_auditoria']}")
     render_metrics(result)
 
     st.subheader("Diagnóstico ejecutivo y plan de acción")
-    diag_df = build_diagnostico_ejecutivo(result, metadata={"sociedad": sociedad, "periodo": f"{int(month):02d}/{int(year)}"})
+    diag_df = build_diagnostico_ejecutivo(result, metadata={"sociedad": sociedad, "periodo": periodo_label})
     st.dataframe(diag_df, use_container_width=True)
-    plan_df = build_plan_accion(result, metadata={"sociedad": sociedad, "periodo": f"{int(month):02d}/{int(year)}"})
+    plan_df = build_plan_accion(result, metadata={"sociedad": sociedad, "periodo": periodo_label})
     st.dataframe(plan_df, use_container_width=True)
 
     if result["tipo_auditoria"] == "Auditoría IVA del Mes":
@@ -1475,19 +1582,22 @@ def main():
         "usuario": st.session_state.get("auth_user", ""),
         "sociedad": sociedad,
         "cuit": cuit_sociedad,
-        "periodo": f"{int(month):02d}/{int(year)}",
-        "archivo_afip": afip_file.name,
-        "archivo_libro": libro_file.name,
+        "periodo": periodo_label,
+        "archivo_afip": file_names_label(afip_files),
+        "archivo_libro": file_names_label(libro_files),
+        "cantidad_archivos_afip": len(afip_files),
+        "cantidad_archivos_libro": len(libro_files),
     }
     excel_bytes = export_excel(result, metadata)
     pdf_bytes = export_pdf(result, metadata)
 
     st.subheader("Paso 3 · Descargar y guardar")
+    safe_periodo = str(periodo_label).replace("/", "_")
     dc1, dc2, dc3 = st.columns(3)
     dc1.download_button(
         "Descargar Excel de Auditoría",
         data=excel_bytes,
-        file_name=f"auditoria_iva_{result['tipo_auditoria'].lower().replace(' ', '_')}_{int(year)}_{int(month):02d}.xlsx",
+        file_name=f"auditoria_iva_{result['tipo_auditoria'].lower().replace(' ', '_')}_{safe_periodo}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -1495,7 +1605,7 @@ def main():
         dc2.download_button(
             "Descargar PDF Ejecutivo",
             data=pdf_bytes,
-            file_name=f"auditoria_iva_{result['tipo_auditoria'].lower().replace(' ', '_')}_{int(year)}_{int(month):02d}.pdf",
+            file_name=f"auditoria_iva_{result['tipo_auditoria'].lower().replace(' ', '_')}_{safe_periodo}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
